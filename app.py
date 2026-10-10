@@ -1,6 +1,7 @@
 
 import io
 from collections import defaultdict
+from functools import lru_cache
 
 import cv2
 import numpy as np
@@ -332,105 +333,332 @@ def make_demo_image():
 
 
 # --------------------------------------------------
-# ORIGINAL DETECTION ALGORITHM — UNCHANGED
+# DETECTION ALGORITHM — ADAPTED FROM alperencubuk/copy-move-forgery-detection
 # --------------------------------------------------
+#
+# Source: forgery_detection.py in that repository (DCT block matching with
+# lexicographic sorting and shift-vector elimination).
+#
+# What is kept from the repository (values copied from its source):
+#   * grayscale conversion, sliding block scan, orthonormal block DCT
+#     (cv2.dct scaling: float32 block / 255 -> DCT -> * 255)
+#   * 8-bit conversion of the coefficients, zig-zag scan, first 16
+#     coefficients, quantization = floor(value / 16)
+#   * lexicographic sort of the 16-value descriptors (ties broken by block
+#     row, then column)
+#   * each block is compared with the next 9 blocks in sorted order
+#   * similarity: Euclidean descriptor distance <= 5
+#   * spatial filter: Euclidean block distance >= min distance
+#   * shift-vector elimination: keep a pair only if its shift vector occurs
+#     at least 20 times
+#   * localization: both blocks of each surviving pair are painted
+#     (block_size - 1) x (block_size - 1) pixels, as the repository paints
+#     7 x 7 pixels for its 8 x 8 blocks
+#
+# What is adapted / differs (these are deliberate and are documented in the
+# technical report):
+#   * Input is an in-memory RGB array, not cv2.imread(); no cv2.imshow(),
+#     no ground-truth mask and no accuracy computation (an uploaded image
+#     has no ground truth).
+#   * np.float (removed from NumPy) is not used.
+#   * Performance: the repository computes one cv2.dct() per block in Python
+#     loops and an O(m^2) elimination loop. Here the same DCT coefficients
+#     are obtained for every block position at once by correlating the
+#     image with the 16 DCT basis kernels (cv2.filter2D), the descriptor is
+#     packed into one 64-bit integer for sorting, neighbour comparison is
+#     vectorized, and shift vectors are counted with np.unique. This is
+#     mathematically the same pipeline, but floating-point rounding can make
+#     a small fraction of quantized coefficients differ by one bin from the
+#     repository's per-block cv2.dct() output.
+#   * The repository's elimination step deletes rows through stale indices
+#     (np.delete inside a loop) and counts vectors with an O(m^2) loop. Here
+#     the intended rule is implemented directly ("keep pairs whose shift
+#     vector appears >= 20 times"), so results can differ slightly.
+#   * The repository's scan loops stop one block position early; here every
+#     valid block position is used.
+#   * Block size is taken from the sidebar (the repository uses 8). The
+#     repository's other constants are kept unchanged.
+#   * The sidebar "Block stride" cannot be honoured in a way that keeps the
+#     repository's behaviour: the repository scans EVERY pixel position
+#     (stride 1). With stride > 1 a copied region is only found when its
+#     shift is a multiple of the stride. The detector therefore always scans
+#     at stride 1 and the stride value is accepted but not used.
+#   * Images with a long side above _CM_MAX_SIDE are downscaled before
+#     analysis to keep memory and run time reasonable; resampling can
+#     weaken exact-copy matches. The minimum distance is scaled with it.
+#   * Very flat blocks (grey-level standard deviation below
+#     _CM_MIN_BLOCK_STD) are skipped. The repository has no such filter;
+#     without it large uniform areas (sky, walls) match each other.
+#
+# Only a short rationale is given for each constant; the repository's own
+# values are marked "repo".
+
+_CM_QUANTIZATION = 16      # repo: quantization
+_CM_FEATURES = 16          # repo: first 16 zig-zag coefficients
+_CM_SIMILARITY = 5.0       # repo: tsimilarity
+_CM_NEIGHBOURS = 9         # repo: j in range(i + 1, i + 10)
+_CM_VECTOR_LIMIT = 20      # repo: vector_limit
+_CM_MAX_SIDE = 1024        # adaptation: performance cap on the long side
+_CM_MIN_BLOCK_STD = 8.0    # adaptation: skip flat blocks (same threshold as the original PixelTrace detector)
+
+
+def _zigzag_order(n):
+    """Zig-zag scan order exactly as built in the repository."""
+    order = []
+    for d in range(2 * n - 1):
+        cells = [(k, d - k) for k in range(n) if 0 <= d - k < n]
+        if d % 2 == 0:
+            cells.reverse()
+        order.extend(cells)
+    return order
+
+
+@lru_cache(maxsize=None)
+def _dct_kernels(n):
+    """
+    Kernels K[k] such that sum(block * K[k]) equals the k-th zig-zag
+    coefficient of cv2.dct(block). Built from cv2.dct itself (the DCT is
+    linear), so the scaling is identical to the repository's.
+    """
+    rows, cols = zip(*_zigzag_order(n)[:_CM_FEATURES])
+    kernels = np.empty((_CM_FEATURES, n, n), dtype=np.float32)
+    for y in range(n):
+        for x in range(n):
+            impulse = np.zeros((n, n), dtype=np.float32)
+            impulse[y, x] = 1.0
+            kernels[:, y, x] = cv2.dct(impulse)[rows, cols]
+    return kernels
+
+
+def _wrap_uint8(values):
+    """
+    Emulates the repository's np.uint8(float32 array) conversion: truncate
+    toward zero, then keep the low 8 bits (what the C cast does on x86).
+    Made explicit because the raw cast is undefined for out-of-range
+    values and differs between CPU architectures / NumPy versions.
+    """
+    return (np.trunc(values).astype(np.int32) & 0xFF).astype(np.uint8)
+
+
+def _packed_descriptors(gray, n):
+    """
+    One 64-bit key per block position: the 16 quantized coefficients
+    (each 0..15) packed as 4-bit fields, first coefficient in the top bits,
+    so ordering the integers equals ordering the descriptors
+    lexicographically. Returned shape: (H - n + 1, W - n + 1).
+    """
+    g = gray.astype(np.float32) / 255.0
+    oh, ow = g.shape[0] - n + 1, g.shape[1] - n + 1
+    kernels = _dct_kernels(n)
+
+    packed = np.zeros((oh, ow), dtype=np.uint64)
+    for k in range(_CM_FEATURES):
+        response = cv2.filter2D(
+            g, cv2.CV_32F, kernels[k],
+            anchor=(0, 0), borderType=cv2.BORDER_REFLECT,
+        )[:oh, :ow]
+        quantized = _wrap_uint8(response * np.float32(255.0)) // _CM_QUANTIZATION
+        packed = (packed << np.uint64(4)) | quantized.astype(np.uint64)
+    return packed
+
+
+def _block_std(gray, n):
+    """Grey-level standard deviation of every n x n block position."""
+    g = gray.astype(np.float64)
+    oh, ow = g.shape[0] - n + 1, g.shape[1] - n + 1
+    mean = cv2.boxFilter(g, -1, (n, n), anchor=(0, 0),
+                         normalize=True, borderType=cv2.BORDER_REFLECT)
+    mean_sq = cv2.boxFilter(g * g, -1, (n, n), anchor=(0, 0),
+                            normalize=True, borderType=cv2.BORDER_REFLECT)
+    return np.sqrt(np.maximum(mean_sq - mean * mean, 0.0))[:oh, :ow]
+
+
+def _match_blocks(gray, n, min_distance, min_std=_CM_MIN_BLOCK_STD):
+    """
+    Core of the repository algorithm on a grayscale array.
+
+    Returns (block_count, candidate_count, selected_count, hit_map) where
+    hit_map is a uint8 (H - n + 1, W - n + 1) array marking block positions
+    that belong to a selected pair.
+    """
+    oh, ow = gray.shape[0] - n + 1, gray.shape[1] - n + 1
+
+    packed = _packed_descriptors(gray, n).ravel()
+    keep = np.flatnonzero(_block_std(gray, n).ravel() >= min_std)
+    block_count = int(keep.size)
+    hit_map = np.zeros((oh, ow), dtype=np.uint8)
+
+    if block_count < 2:
+        return block_count, 0, 0, hit_map
+
+    # Lexicographic sort. `keep` is in row-major order and the sort is
+    # stable, so ties are ordered by row then column (as in the repository,
+    # where the coordinates are the last sort keys).
+    order = np.argsort(packed[keep], kind="stable")
+    position = keep[order]                      # flat block index, sorted
+    keys = packed[position]
+    rows = (position // ow).astype(np.int32)
+    cols = (position % ow).astype(np.int32)
+
+    shifts = np.uint64(60) - np.uint64(4) * np.arange(
+        _CM_FEATURES, dtype=np.uint64
+    )
+    features = ((keys[:, None] >> shifts) & np.uint64(15)).astype(np.int32)
+
+    # Compare every block with the next _CM_NEIGHBOURS blocks.
+    min_d2 = int(min_distance) ** 2
+    first, second, vec_y, vec_x = [], [], [], []
+
+    for offset in range(1, _CM_NEIGHBOURS + 1):
+        if block_count <= offset:
+            break
+        diff = features[:-offset] - features[offset:]
+        similar = np.einsum("ij,ij->i", diff, diff) <= _CM_SIMILARITY ** 2
+        i = np.flatnonzero(similar)
+        if i.size == 0:
+            continue
+        j = i + offset
+        dy = rows[j] - rows[i]
+        dx = cols[j] - cols[i]
+        far = dy.astype(np.int64) ** 2 + dx.astype(np.int64) ** 2 >= min_d2
+        first.append(i[far])
+        second.append(j[far])
+        vec_y.append(dy[far])
+        vec_x.append(dx[far])
+
+    if not first:
+        return block_count, 0, 0, hit_map
+
+    first = np.concatenate(first)
+    second = np.concatenate(second)
+    vec_y = np.concatenate(vec_y).astype(np.int64)
+    vec_x = np.concatenate(vec_x).astype(np.int64)
+    candidate_count = int(first.size)
+
+    if candidate_count == 0:
+        return block_count, 0, 0, hit_map
+
+    # Shift-vector elimination: keep pairs whose vector occurs at least
+    # _CM_VECTOR_LIMIT times (the repository's vector is signed).
+    vector_key = (vec_y + oh) * (2 * ow + 1) + (vec_x + ow)
+    _, inverse, counts = np.unique(
+        vector_key, return_inverse=True, return_counts=True
+    )
+    selected = counts[inverse.ravel()] >= _CM_VECTOR_LIMIT
+    selected_count = int(selected.sum())
+
+    if selected_count:
+        flat = hit_map.reshape(-1)
+        flat[position[first[selected]]] = 1
+        flat[position[second[selected]]] = 1
+
+    return block_count, candidate_count, selected_count, hit_map
+
+
 def detect_copy_move(
     rgb, block_size=16, stride=8, min_distance=40, threshold=0.06
 ):
     """
-    Traditional block-based DCT matching.
-    Classroom prototype; repeated textures can create false positives.
+    Copy-move detector adapted from alperencubuk/copy-move-forgery-detection
+    (see the notes above for exactly what was kept and what was adapted).
+
+    `stride` and `threshold` are accepted for interface compatibility only:
+    the repository scans every pixel position and has no threshold of that
+    kind.
+
+    Returns:
+        marked, mask, block_count, candidate_count, selected_count
     """
+    if rgb is None:
+        raise ValueError("No image data was provided.")
+    rgb = np.asarray(rgb)
+    if rgb.ndim not in (2, 3) or rgb.size == 0:
+        raise ValueError("The image is empty or has an unsupported shape.")
+    if rgb.ndim == 2:
+        rgb = np.stack([rgb] * 3, axis=-1)
+    elif rgb.shape[2] == 1:
+        rgb = np.repeat(rgb, 3, axis=2)
+    elif rgb.shape[2] >= 4:
+        rgb = rgb[:, :, :3]
+    elif rgb.shape[2] != 3:
+        raise ValueError("The image must have 1, 3 or 4 channels.")
+    rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+
+    n = int(block_size)
     h0, w0 = rgb.shape[:2]
-    scale = min(1.0, 512.0 / max(h0, w0))
-    if scale < 1:
-        resized = cv2.resize(
+    if h0 < n or w0 < n:
+        raise ValueError(f"Image is too small for {n}x{n} blocks.")
+
+    # Keep processing practical on ordinary laptops.
+    scale = min(1.0, float(_CM_MAX_SIDE) / max(h0, w0))
+    if scale < 1.0:
+        working = cv2.resize(
             rgb,
-            (max(1, int(w0 * scale)), max(1, int(h0 * scale)))
+            (max(1, int(round(w0 * scale))), max(1, int(round(h0 * scale)))),
+            interpolation=cv2.INTER_AREA,
         )
-        gray = cv2.cvtColor(resized, cv2.COLOR_RGB2GRAY)
     else:
-        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        working = rgb
 
+    gray = cv2.cvtColor(working, cv2.COLOR_RGB2GRAY)
     h, w = gray.shape
-    if h < block_size or w < block_size:
-        raise ValueError(
-            "Image is too small. Please upload an image at least 16 × 16 pixels."
+    if h < n or w < n:
+        raise ValueError(f"Image is too small for {n}x{n} blocks.")
+
+    working_distance = max(1, int(round(min_distance * scale)))
+    block_count, candidate_count, selected_count, hit_map = _match_blocks(
+        gray, n, working_distance
+    )
+
+    # Paint (n - 1) x (n - 1) pixels from every flagged block origin.
+    mask_small = np.zeros((h, w), dtype=np.uint8)
+    if selected_count:
+        canvas = np.zeros((h, w), dtype=np.uint8)
+        canvas[:hit_map.shape[0], :hit_map.shape[1]] = hit_map
+        k = max(1, n - 1)
+        mask_small = cv2.dilate(
+            canvas, np.ones((k, k), dtype=np.uint8), anchor=(k - 1, k - 1)
+        ) * np.uint8(255)
+
+    # Restore the mask to the original image dimensions.
+    if (h, w) != (h0, w0):
+        mask = cv2.resize(
+            mask_small, (w0, h0), interpolation=cv2.INTER_NEAREST
         )
+    else:
+        mask = mask_small
 
-    buckets = defaultdict(list)
-    descriptors = []
-    coords = []
-
-    for y in range(0, h - block_size + 1, stride):
-        for x in range(0, w - block_size + 1, stride):
-            block = gray[y:y + block_size, x:x + block_size].astype(np.float32)
-            if float(block.std()) < 8.0:
-                continue
-            dct = cv2.dct(block)
-            feat = dct[:8, :8].flatten()[1:]
-            feat = feat / (float(np.linalg.norm(feat)) + 1e-8)
-            key = tuple(np.round(feat / threshold).astype(np.int16).tolist())
-            idx = len(coords)
-            coords.append((x, y))
-            descriptors.append(feat)
-            buckets[key].append(idx)
-
-    pairs = []
-    for ids in buckets.values():
-        if len(ids) < 2:
-            continue
-        ids = ids[:80]
-        for a_pos in range(len(ids)):
-            ia = ids[a_pos]
-            xa, ya = coords[ia]
-            for b_pos in range(a_pos + 1, len(ids)):
-                ib = ids[b_pos]
-                xb, yb = coords[ib]
-                if (xa - xb) ** 2 + (ya - yb) ** 2 < min_distance ** 2:
-                    continue
-                sim = float(np.dot(descriptors[ia], descriptors[ib]))
-                if sim > 0.985:
-                    pairs.append((ia, ib, sim))
-
-    offset_counts = defaultdict(list)
-    for ia, ib, sim in pairs:
-        xa, ya = coords[ia]
-        xb, yb = coords[ib]
-        dx, dy = xb - xa, yb - ya
-        if dx < 0 or (dx == 0 and dy < 0):
-            dx, dy = -dx, -dy
-            ia, ib = ib, ia
-        offset_counts[(dx, dy)].append((ia, ib, sim))
-
-    selected = []
-    for group in offset_counts.values():
-        if len(group) >= 3:
-            selected.extend(group)
-    if not selected and pairs:
-        selected = sorted(pairs, key=lambda p: p[2], reverse=True)[:30]
-
-    mask = np.zeros((h, w), dtype=np.uint8)
-    for ia, ib, _ in selected:
-        for idx in (ia, ib):
-            x, y = coords[idx]
-            mask[y:y + block_size, x:x + block_size] = 255
-
-    if scale < 1:
-        mask = cv2.resize(mask, (w0, h0), interpolation=cv2.INTER_NEAREST)
-
+    # Preserve PixelTrace's existing red overlay.
     marked = rgb.copy()
-    if mask.any():
-        red = np.zeros_like(marked)
-        red[:, :, 0] = 255
-        m = mask > 0
-        marked[m] = (0.55 * marked[m] + 0.45 * red[m]).astype(np.uint8)
-        contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        cv2.drawContours(marked, contours, -1, (255, 30, 30), 2)
 
-    return marked, mask, len(coords), len(pairs), len(selected)
+    if np.any(mask):
+        flagged = mask > 0
+        marked[flagged] = (
+            0.55 * marked[flagged].astype(np.float32)
+            + 0.45 * np.array([255, 0, 0], dtype=np.float32)
+        ).astype(np.uint8)
+
+        contours, _ = cv2.findContours(
+            mask.copy(),
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+
+        cv2.drawContours(
+            marked,
+            contours,
+            -1,
+            (255, 30, 30),
+            2,
+        )
+
+    return (
+        marked,
+        mask,
+        block_count,
+        candidate_count,
+        selected_count,
+    )
 
 
 # --------------------------------------------------
@@ -629,16 +857,19 @@ if rgb is not None:
         st.markdown("""
 **Detection pipeline**
 
-1. **Preprocessing:** Convert RGB pixels to grayscale; downscale very large images.
-2. **Block extraction:** Traverse overlapping image blocks using the configured stride.
-3. **DCT feature extraction:** Compute the Discrete Cosine Transform and retain low-frequency coefficients.
-4. **Descriptor matching:** Normalize and quantize block descriptors to find similar candidates.
-5. **Spatial filtering:** Exclude nearby matches and group matches by displacement vectors.
+1. **Preprocessing:** Convert RGB pixels to grayscale; downscale very large images (long side above 1,024 pixels).
+2. **Block extraction:** Scan every overlapping block position (stride 1, as in the referenced implementation); nearly flat blocks are skipped.
+3. **DCT feature extraction:** Compute the block Discrete Cosine Transform, convert to 8-bit values, zig-zag scan, and quantize the first 16 coefficients.
+4. **Descriptor matching:** Sort the descriptors lexicographically and compare each block with the next 9 in sorted order; keep pairs with descriptor distance of 5 or less.
+5. **Spatial filtering:** Exclude pairs closer than the minimum match distance, then keep only pairs whose displacement vector occurs at least 20 times.
 6. **Localization:** Build a binary mask and overlay selected blocks in red.
 
 **Interpretation and limitations**
 
 - This is a traditional image-processing prototype, not an AI or machine-learning system.
+- The detector is adapted from the open-source *alperencubuk/copy-move-forgery-detection* project; it is a re-implementation, not an exact reproduction. Differences include vectorized computation, a flat-block filter, a configurable block size and a downscaling limit.
+- The block-stride setting has no effect: the referenced method scans every pixel position, and larger strides miss copies whose shift is not a multiple of the stride.
+- No accuracy or confidence score is computed; an uploaded image has no ground truth to compare against.
 - Repeated natural textures can generate false positives.
 - Rotation, resizing, compression, or other transformations can reduce detection reliability.
 - A highlighted area is a candidate for human review, not conclusive proof of manipulation.
